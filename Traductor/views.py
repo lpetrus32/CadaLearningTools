@@ -1,41 +1,32 @@
-from django.shortcuts import render
-from django.core.cache import cache
 
 from babel import Locale
-from googletrans import Translator, LANGUAGES
+from deep_translator import GoogleTranslator
+import time
 
-import asyncio
+from django.shortcuts import render
+from django.core.cache import cache
+from django.utils.text import slugify
+
 
 
 def get_languages():
-
-    # Cherche d'abord la liste dans le cache
-    languages = cache.get("googletrans_languages")
-
+    """Retourne la liste des langues avec nom FR et nom natif, en cache."""
+    languages = cache.get("deep_translator_languages")
     if languages is not None:
         return languages
 
-    # Si elle n'existe pas encore, on la construit
+    # dict {nom_anglais: code} fourni par deep_translator
+    supported = GoogleTranslator().get_supported_languages(as_dict=True)
+
     french_locale = Locale("fr")
     languages = []
 
-    for code, english_name in LANGUAGES.items():
+    for english_name, code in supported.items():
+        french_name = french_locale.languages.get(code, english_name)
 
-        # Nom de la langue en français
-        french_name = french_locale.languages.get(
-            code,
-            english_name
-        )
-
-        # Nom de la langue dans sa propre langue
         try:
-            native_locale = Locale(code)
-
-            native_name = native_locale.languages.get(
-                code,
-                english_name
-            )
-
+            native_locale = Locale.parse(code, sep='-')
+            native_name = native_locale.languages.get(code, english_name)
         except Exception:
             native_name = english_name
 
@@ -46,77 +37,77 @@ def get_languages():
             "search": f"{french_name} {native_name}",
         })
 
-    # Tri alphabétique français
-    languages.sort(
-        key=lambda language: language["name"]
-    )
-
-    # Stockage dans le cache
-    cache.set(
-        "googletrans_languages",
-        languages,
-        timeout=None
-    )
+    languages.sort(key=lambda language: language["name"])
+    cache.set("deep_translator_languages", languages, timeout=None)
 
     return languages
 
 
-async def translate_text_async(
-    text,
-    language_codes,
-    language_names
-):
-    translations = []
+def translate_one(text, code, source="fr", retries=2, delay=1):
+    cache_key = slugify(f"translation_{source}_{code}_{text}")
+    cached_result = cache.get(cache_key)
+   
+    if cached_result is not None: 
+        return cached_result
 
-    async with Translator() as translator:
+    last_error = None
 
-        for code in language_codes:
+    for attempt in range(retries + 1):
+        try:
+            result = GoogleTranslator(source=source, target=code).translate(text)
+            cache.set(cache_key, result, timeout=None)
+            return result
+        except Exception as error:
+            last_error = error
+            if attempt < retries:
+                time.sleep(delay)
 
-            language_name = language_names.get(
-                code,
-                code
-            )
-
-            try:
-                print(code, language_name)
-                result = await translator.translate(
-                    text,
-                    dest=code
-                )
-                
-                translations.append({
-                    "code": code,
-                    "language": language_name,
-                    "text": result.text,
-                })
-
-            except Exception as error:
-
-                translations.append({
-                    "code": code,
-                    "language": language_name,
-                    "text": f"Erreur de traduction : {error}",
-                })
-
-    return translations
+    raise last_error
 
 
-def translate_text(text, language_codes):
+def translate_text(text, language_codes, source="fr"):
+    if not text or not language_codes:
+        return []
 
     languages = get_languages()
-
     language_names = {
         language["code"]: language["name"]
         for language in languages
+        if language["code"] in language_codes
     }
 
-    return asyncio.run(
-        translate_text_async(
-            text,
-            language_codes,
-            language_names
-        )
-    )
+    unique_codes = list(dict.fromkeys(
+        code for code in language_codes
+    ))
+
+    if not unique_codes:
+        return []
+
+    translations = []
+    for code in unique_codes:
+        language_name = language_names.get(code, code)
+
+        try:
+            result_text = translate_one(
+                text,
+                code,
+                source=source,
+                retries=4,
+                delay=1
+            )
+            is_erreur = False
+        except Exception:
+            result_text = f"Erreur de traduction"
+            is_erreur = True
+           
+        translations.append({
+            "code": code,
+            "language": language_name,
+            "text": result_text,
+            "is_erreur": is_erreur
+        })
+
+    return translations
 
 
 def home(request):
@@ -131,12 +122,10 @@ def home(request):
 
         text = request.POST.get(
             "text",
-            ""
-        ).strip()
+            "").strip()
 
         selected_languages = request.POST.getlist(
-            "languages"
-        )
+            "languages") 
 
         if text and selected_languages:
 
